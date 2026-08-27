@@ -1,0 +1,3 @@
+# Only needed for natural-language mode (the LLM intent resolver).
+# The structured-command fallback and the executor work with no dependencies.
+anthropic>=0.40

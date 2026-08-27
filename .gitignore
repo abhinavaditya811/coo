@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local config: after `spotify_sync.py` runs this holds your personal
+# playlist library, so it stays out of the repo. See the .example file.
+spotify_playlists.json
+
+# Secrets / local env
+.env
+*.local
