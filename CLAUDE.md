@@ -16,6 +16,8 @@ the Mac is where things actually happen.
 - `spotify_sync.py` — one-off helper: OAuth (PKCE) to the Spotify Web API to
   populate `spotify_playlists.json`. Never imported by the kernel; keeps the
   network out of the request path.
+- `install_launchagent.sh` — installs the LaunchAgent that keeps the kernel
+  running across reboots (needed for the iPhone/SMS channels to be reachable).
 - `requirements.txt` — only `anthropic`, and only for natural-language mode.
 - `DESIGN.md` — architecture, decisions, diagrams.
 
@@ -51,7 +53,9 @@ running model.
 3. **Auth.** Every `/run` request is checked against `AGENT_TOKEN`. Don't add
    unauthenticated mutating endpoints.
 4. **Exposure.** Bind to `127.0.0.1` by default; reach it remotely only over a
-   Tailscale tailnet. Never add or document a public internet port-forward.
+   Tailscale tailnet. `AGENT_HOST=tailscale` binds solely to the `100.x` address
+   and fails closed if the tailnet is down — prefer it to `0.0.0.0`. Never add or
+   document a public internet port-forward.
 
 ## Adding a capability
 1. Write an executor in `capabilities.py` that takes explicit args and returns a
@@ -83,6 +87,7 @@ explicitly because the resolver picks by description alone — a vague one sends
 ## Status
 - **Built:** kernel loop + Mac executor (11 capabilities) + pluggable intent
   provider (local llama.cpp/Qwen by default, Claude as fallback).
-- **Next:** iPhone Shortcut → HTTP over Tailscale.
+- **Next:** iPhone Shortcut → HTTP over Tailscale (kernel side done:
+  tailnet-only binding, `?format=text` replies, LaunchAgent; needs a tailnet).
 - **Later:** confirmation flow (designed in DESIGN.md), SMS gateway (offline
   channel), iPhone-side execution.

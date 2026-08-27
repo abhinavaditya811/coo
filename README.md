@@ -160,13 +160,66 @@ becomes callable without new Python.
 
 ## Driving it from your iPhone (later)
 This is the "use my Mac through my iPhone" path, no companion app required:
-1. Put your Mac and iPhone on a **Tailscale** tailnet — the Mac gets a stable
-   address reachable from anywhere.
-2. Set `AGENT_HOST=0.0.0.0` (Tailscale's ACLs, not the open internet, are your
-   perimeter) and keep a strong `AGENT_TOKEN`.
-3. In the iPhone **Shortcuts** app, use **Get Contents of URL**: POST to
-   `http://<mac-tailscale-ip>:8765/run` with header `Authorization: Bearer <token>`
-   and JSON body `{"query": <your dictated/typed text>}`. Show the `result` field.
+### 1. Join both devices to a tailnet
+Install [Tailscale](https://tailscale.com) on the Mac and from the App Store on the
+iPhone, and sign both into the **same account**. Find the Mac's address:
+
+```bash
+tailscale ip -4        # e.g. 100.101.102.103
+```
+
+### 2. Run the kernel on the tailnet
+```bash
+export AGENT_TOKEN=$(openssl rand -hex 32)
+export AGENT_HOST=tailscale       # binds ONLY to the Tailscale address
+python3 kernel.py
+```
+
+`AGENT_HOST=tailscale` resolves this Mac's `100.x` address itself and binds just
+that interface. Prefer it to `0.0.0.0`, which would also expose the kernel to every
+coffee-shop Wi-Fi you join. If Tailscale isn't connected the kernel refuses to
+start rather than falling back to something broader.
+
+Keep it running across reboots:
+
+```bash
+AGENT_TOKEN=$AGENT_TOKEN ./install_launchagent.sh
+```
+
+That installs a LaunchAgent (`~/Library/LaunchAgents/com.coo.kernel.plist`, mode
+600 since it holds your token) which starts at login, restarts on crash, and logs
+to `~/Library/Logs/coo-kernel.log`.
+
+### 3. Build the iPhone Shortcut
+In **Shortcuts** → **+** → add these actions in order:
+
+| # | Action | Configuration |
+|---|--------|---------------|
+| 1 | **Dictate Text** | Language: English. (Or **Ask for Input** to type instead.) |
+| 2 | **Get Contents of URL** | URL: `http://100.101.102.103:8765/run?format=text` |
+| | | Method: **POST** |
+| | | Headers: `Authorization` = `Bearer <your AGENT_TOKEN>` |
+| | | Request Body: **JSON**, one field `query` (Text) = the **Dictated Text** variable |
+| 3 | **Speak Text** | Input: **Contents of URL** |
+
+Name it something Siri-friendly like **"Ask My Mac"**, then say *"Hey Siri, Ask My
+Mac"* and speak your request.
+
+The `?format=text` is what makes this simple: the kernel replies with the bare
+result string instead of JSON, so step 3 speaks it directly with no parsing. Drop
+the parameter and you get the full JSON (`status`, `capability`, `params`,
+`result`) if you'd rather branch on it. `Accept: text/plain` or `"format":"text"`
+in the body do the same thing.
+
+### Checks
+```bash
+# from the Mac
+curl -s "http://$(tailscale ip -4):8765/run?format=text" \
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  -d '{"query":"what is playing on spotify"}'
+```
+From the iPhone, open `http://<mac-tailscale-ip>:8765/health` in Safari — it should
+show `{"ok": true}`. If it doesn't, the tailnet is the problem, not the kernel.
 
 The same endpoint is what the SMS gateway webhook will POST to when you add the
 offline channel.
