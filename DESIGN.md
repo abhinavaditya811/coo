@@ -169,10 +169,10 @@ CloudKit** is a possible future async bus if cross-device state sync is wanted.
 | Layer | State |
 |---|---|
 | Kernel loop (auth, intent, router, egress) | Built |
-| Mac executor (10 capabilities) | Built |
+| Mac executor (11 capabilities) | Built |
 | Intent provider (local llama.cpp default, pluggable) | Built |
-| iPhone Shortcut → HTTP over Tailscale | Next |
-| Confirmation flow for sensitive actions | Designed (above), not built |
+| iPhone Shortcut → HTTP over Tailscale | Built |
+| Confirmation flow for sensitive actions | **Next** — designed above, not built |
 | SMS gateway (offline channel) | Later |
 | iPhone-side execution | Later |
 

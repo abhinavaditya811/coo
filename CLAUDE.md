@@ -81,13 +81,17 @@ explicitly because the resolver picks by description alone — a vague one sends
 - Keep executors small and single-purpose; keep human-facing result strings short
   (they may be delivered over SMS one day, ~160 chars per segment).
 - Sensitive or destructive capabilities must gain a confirmation step before they
-  execute (see `DESIGN.md` → "Confirmation flow for sensitive actions"). Mark them
-  with a `sensitive` flag in the registry; `send_imessage` is the current example.
+  execute (see `DESIGN.md` → "Confirmation flow for sensitive actions"). The
+  `sensitive` flag is **designed but not yet implemented**; until it is,
+  `send_imessage` sends with no confirmation.
 
 ## Status
 - **Built:** kernel loop + Mac executor (11 capabilities) + pluggable intent
   provider (local llama.cpp/Qwen by default, Claude as fallback).
-- **Next:** iPhone Shortcut → HTTP over Tailscale (kernel side done:
-  tailnet-only binding, `?format=text` replies, LaunchAgent; needs a tailnet).
+- **Built:** iPhone Shortcut → HTTP over Tailscale (tailnet-only binding,
+  `?format=text` replies, LaunchAgent autostart).
+- **Next:** confirmation flow for sensitive actions. NOTE: the `sensitive` flag
+  is described in DESIGN.md but is **not implemented** — `send_imessage`
+  currently executes immediately.
 - **Later:** confirmation flow (designed in DESIGN.md), SMS gateway (offline
   channel), iPhone-side execution.
