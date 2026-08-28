@@ -296,6 +296,9 @@ CAPABILITIES = {
             "body": "The message text to send.",
         },
         "execute": lambda p: send_imessage(p["recipient"], p["body"]),
+        # Contacts another person as you — never fires from a single message.
+        "sensitive": True,
+        "confirm": lambda p: f'iMessage {p.get("recipient")}: "{p.get("body")}"',
     },
     "speak": {
         "description": "Speak the given text aloud on the Mac using text-to-speech.",
@@ -349,6 +352,25 @@ def execute(capability, params):
     if not spec:
         raise CapabilityError(f"Unknown capability: {capability!r}")
     return spec["execute"](params or {})
+
+
+def is_sensitive(capability):
+    """Sensitive capabilities need a confirmation step before they execute."""
+    return bool(CAPABILITIES.get(capability, {}).get("sensitive"))
+
+
+def describe(capability, params, limit=90):
+    """One short line echoing exactly what is about to happen, so the user sees
+    the real parameters before approving. Kept short for SMS."""
+    spec = CAPABILITIES.get(capability) or {}
+    params = params or {}
+    try:
+        text = spec["confirm"](params)
+    except (KeyError, TypeError):
+        args = ", ".join(f"{k}={v}" for k, v in params.items())
+        text = f"{capability}" + (f" ({args})" if args else "")
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
 # ---------------------------------------------------------------------------

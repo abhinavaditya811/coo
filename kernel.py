@@ -27,7 +27,9 @@ import subprocess
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from capabilities import CAPABILITIES, execute, CapabilityError
+import sessions
+from capabilities import (CAPABILITIES, execute, CapabilityError, describe,
+                          is_sensitive)
 from resolver import resolve
 
 PORT = int(os.environ.get("AGENT_PORT", "8765"))
@@ -68,6 +70,11 @@ def resolve_host(value):
 
 HOST = resolve_host(os.environ.get("AGENT_HOST", "127.0.0.1"))
 
+# Pending confirmations for sensitive capabilities.
+PENDING = sessions.PendingStore()
+CONFIRM_RE = re.compile(r"^\s*confirm\s+([A-Za-z0-9]{%d})\s*$" % sessions.CODE_LENGTH,
+                        re.IGNORECASE)
+
 
 def _authorized(handler, body):
     if not TOKEN:
@@ -80,11 +87,10 @@ def _authorized(handler, body):
 
 def as_text(payload):
     """Flatten a response to one speakable line for Shortcuts / Siri."""
-    status = payload.get("status")
-    if status == "ok":
+    if payload.get("status") == "ok":
         return str(payload.get("result", "Done."))
-    if status == "no_action":
-        return str(payload.get("message", "Nothing to do."))
+    if payload.get("message"):
+        return str(payload["message"])
     return "Error: " + str(payload.get("error", "something went wrong."))
 
 
@@ -148,6 +154,22 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             return self._send(400, {"error": "missing 'query'"})
 
+        # Who is asking. The SMS gateway will pass the sender's number; over
+        # HTTP everyone holding the token is the same principal.
+        sender = str(body.get("sender") or "token")
+
+        # "confirm 7QF2" releases a previously stashed sensitive action. Checked
+        # before the resolver: it is a protocol word, not a capability.
+        match = CONFIRM_RE.match(query)
+        if match:
+            claimed = PENDING.claim(sender, match.group(1))
+            if not claimed:
+                return self._send(200, {"status": "no_action", "message":
+                    "That code isn't valid — it may have expired, been used "
+                    "already, or belong to a different sender."})
+            capability, params = claimed
+            return self._execute(capability, params)
+
         try:
             capability, params, message = resolve(query)
         except Exception as e:  # LLM / network failure
@@ -157,6 +179,21 @@ class Handler(BaseHTTPRequestHandler):
             # Nothing to run; relay the model's message (e.g. clarification).
             return self._send(200, {"status": "no_action", "message": message})
 
+        # Sensitive actions never fire from the message that requested them.
+        if is_sensitive(capability):
+            code = PENDING.stash(sender, capability, params)
+            return self._send(200, {
+                "status": "confirmation_required",
+                "capability": capability,
+                "params": params,
+                "code": code,
+                "message": f'About to {describe(capability, params)}. '
+                           f'Reply "confirm {code}" to send.',
+            })
+
+        return self._execute(capability, params)
+
+    def _execute(self, capability, params):
         try:
             result = execute(capability, params)
         except CapabilityError as e:
