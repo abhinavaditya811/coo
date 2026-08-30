@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en" data-palette="#2a78d6">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coo — request history</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f4f3f1;
+    --surface-1: #fcfcfb;
+    --border:    #e2e1dd;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #78776f;
+    --series-1: #2a78d6;
+    --good:     #0ca30c;
+    --warning:  #fab219;
+    --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-0: #111110;
+      --surface-1: #1a1a19;
+      --border:    #34342f;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #8f8e84;
+      --series-1: #3987e5;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #111110;
+    --surface-1: #1a1a19;
+    --border:    #34342f;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #8f8e84;
+    --series-1: #3987e5;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--surface-0); color: var(--text-primary);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--text-muted); font-size: 13px; }
+  .spacer { flex: 1; }
+
+  button, select, input {
+    font: inherit; color: var(--text-primary);
+    background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--text-muted); }
+  input[type=search] { min-width: 230px; }
+  label.chk { color: var(--text-secondary); display: inline-flex; align-items: center; gap: 6px; }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 11px; padding: 16px;
+  }
+
+  /* ---- KPI row: hero numbers, no plot ---- */
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+  .kpi-label { color: var(--text-secondary); font-size: 12px; letter-spacing: 0.02em; text-transform: uppercase; }
+  .kpi-value { font-size: 27px; font-weight: 600; margin-top: 5px; letter-spacing: -0.02em;
+               font-variant-numeric: tabular-nums; }
+  .kpi-note  { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+
+  /* ---- single-series bars: no legend, direct labels ---- */
+  .bars { display: flex; flex-direction: column; gap: 2px; margin-top: 12px; }
+  .bar-row { display: grid; grid-template-columns: 150px 1fr 44px; align-items: center; gap: 10px; }
+  .bar-name { color: var(--text-secondary); font-size: 13px; text-align: right;
+              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-track { background: transparent; height: 17px; position: relative; }
+  .bar-fill {
+    height: 100%; background: var(--series-1);
+    border-radius: 0 4px 4px 0;           /* rounded data-end, anchored at baseline */
+    min-width: 2px; transition: width .18s ease;
+  }
+  .bar-row:hover .bar-fill { filter: brightness(1.12); }
+  .bar-value { color: var(--text-secondary); font-size: 13px; font-variant-numeric: tabular-nums; }
+  h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--text-secondary);
+       text-transform: uppercase; letter-spacing: 0.03em; }
+
+  .filters { display: flex; gap: 9px; align-items: center; margin: 16px 0 10px; flex-wrap: wrap; }
+
+  /* ---- table ---- */
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--text-muted);
+    padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:hover { background: var(--surface-0); }
+  tbody tr.expandable { cursor: pointer; }
+  .t-time { color: var(--text-muted); white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .t-query { font-weight: 500; }
+  .t-cap { color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .t-result { color: var(--text-secondary); }
+  .t-ms { text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .none { color: var(--text-muted); }
+
+  /* status: color + icon + label, never color alone */
+  .chip { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+          font-size: 12.5px; color: var(--text-secondary); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .s-ok       .dot { background: var(--good); }
+  .s-error    .dot { background: var(--critical); }
+  .s-confirm  .dot { background: var(--warning); }
+  .s-none     .dot { background: var(--text-muted); }
+
+  .detail { background: var(--surface-0); }
+  .detail pre {
+    margin: 0; padding: 10px 12px; overflow-x: auto;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
+  }
+  .empty { padding: 40px; text-align: center; color: var(--text-muted); }
+  .pager { display: flex; gap: 9px; align-items: center; justify-content: flex-end;
+           margin-top: 13px; color: var(--text-secondary); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Coo</h1>
+    <span class="sub" id="subtitle">request history</span>
+    <span class="spacer"></span>
+    <label class="chk"><input type="checkbox" id="auto"> auto-refresh</label>
+    <button id="refresh">Refresh</button>
+    <button id="theme" title="Toggle theme">◐</button>
+  </header>
+
+  <section class="kpis" id="kpis"></section>
+
+  <section class="card">
+    <h2>Capability usage</h2>
+    <div class="bars" id="bars"></div>
+  </section>
+
+  <div class="filters">
+    <input type="search" id="search" placeholder="Search query, result, or error…">
+    <select id="status">
+      <option value="">All statuses</option>
+      <option value="ok">ok</option>
+      <option value="error">error</option>
+      <option value="confirmation_required">confirmation_required</option>
+      <option value="no_action">no_action</option>
+    </select>
+    <select id="capability"><option value="">All capabilities</option></select>
+    <span class="spacer"></span>
+    <span class="sub" id="count"></span>
+  </div>
+
+  <section class="card" style="padding:0; overflow:hidden;">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Query</th><th>Capability</th><th>Status</th>
+        <th>Result</th><th style="text-align:right">Took</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>No requests recorded yet.</div>
+  </section>
+
+  <div class="pager">
+    <button id="prev">← Newer</button>
+    <span id="page"></span>
+    <button id="next">Older →</button>
+  </div>
+</div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const PAGE = 50;
+let offset = 0, total = 0;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+
+const STATUS = {
+  ok:                    { cls: "s-ok",      icon: "✓", label: "ok" },
+  error:                 { cls: "s-error",   icon: "✕", label: "error" },
+  confirmation_required: { cls: "s-confirm", icon: "!", label: "awaiting confirm" },
+  no_action:             { cls: "s-none",    icon: "–", label: "no action" },
+};
+
+function chip(status) {
+  const s = STATUS[status] || { cls: "s-none", icon: "–", label: status || "unknown" };
+  // icon + text label, so status never depends on color alone
+  return `<span class="chip ${s.cls}"><span class="dot"></span>${s.icon} ${esc(s.label)}</span>`;
+}
+
+function when(ts) {
+  const d = new Date(ts * 1000), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return d.toDateString() === now.toDateString()
+    ? time
+    : d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + time;
+}
+
+function renderKpis(st) {
+  const rate = st.total ? Math.round((st.ok / st.total) * 100) : null;
+  const tiles = [
+    { label: "Requests",       value: st.total,
+      note: st.total === 1 ? "1 recorded" : `${st.total} recorded` },
+    { label: "Succeeded",      value: rate === null ? "—" : rate + "%",
+      note: `${st.ok} ok · ${st.errors} error${st.errors === 1 ? "" : "s"}` },
+    { label: "Awaiting confirm", value: st.confirmations,
+      note: "sensitive actions held" },
+    { label: "Median latency", value: st.median_ms === null ? "—" : st.median_ms + " ms",
+      note: "median, not mean" },
+  ];
+  $("kpis").innerHTML = tiles.map(t => `
+    <div class="card">
+      <div class="kpi-label">${esc(t.label)}</div>
+      <div class="kpi-value">${esc(t.value)}</div>
+      <div class="kpi-note">${esc(t.note)}</div>
+    </div>`).join("");
+}
+
+function renderBars(caps) {
+  if (!caps.length) { $("bars").innerHTML = `<div class="none">Nothing recorded yet.</div>`; return; }
+  const max = Math.max(...caps.map(c => c.count));
+  $("bars").innerHTML = caps.map(c => `
+    <div class="bar-row" title="${esc(c.capability)}: ${c.count} request${c.count === 1 ? "" : "s"}">
+      <div class="bar-name">${esc(c.capability)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${(c.count / max) * 100}%"></div></div>
+      <div class="bar-value">${c.count}</div>
+    </div>`).join("");
+}
+
+function renderRows(rows) {
+  $("empty").hidden = rows.length > 0;
+  $("rows").innerHTML = rows.map((r, i) => {
+    const body = r.error || r.result || "";
+    const short = body.length > 70 ? esc(body.slice(0, 69)) + "…" : esc(body);
+    let params = "";
+    try { params = r.params ? JSON.stringify(JSON.parse(r.params)) : ""; } catch { params = r.params || ""; }
+    const detail = [
+      `query:      ${r.query}`,
+      r.capability ? `capability: ${r.capability}` : null,
+      params ? `params:     ${params}` : null,
+      r.result ? `result:     ${r.result}` : null,
+      r.error ? `error:      ${r.error}` : null,
+      r.sender ? `sender:     ${r.sender}` : null,
+    ].filter(Boolean).join("\n");
+    return `
+      <tr class="expandable" data-i="${i}">
+        <td class="t-time">${esc(when(r.ts))}</td>
+        <td class="t-query">${esc(r.query)}</td>
+        <td class="t-cap">${r.capability ? esc(r.capability) : '<span class="none">—</span>'}</td>
+        <td>${chip(r.status)}</td>
+        <td class="t-result">${short || '<span class="none">—</span>'}</td>
+        <td class="t-ms">${r.duration_ms == null ? "—" : r.duration_ms + " ms"}</td>
+      </tr>
+      <tr class="detail" id="d${i}" hidden><td colspan="6"><pre>${esc(detail)}</pre></td></tr>`;
+  }).join("");
+
+  document.querySelectorAll("tr.expandable").forEach(tr => {
+    tr.onclick = () => { const d = $("d" + tr.dataset.i); d.hidden = !d.hidden; };
+  });
+}
+
+async function load() {
+  const p = new URLSearchParams({ token: TOKEN, limit: PAGE, offset });
+  if ($("search").value)     p.set("search", $("search").value);
+  if ($("status").value)     p.set("status", $("status").value);
+  if ($("capability").value) p.set("capability", $("capability").value);
+
+  let data;
+  try {
+    const res = await fetch("/api/history?" + p);
+    if (res.status === 401) { $("subtitle").textContent = "unauthorized — check the ?token= in the URL"; return; }
+    data = await res.json();
+  } catch (e) { $("subtitle").textContent = "could not reach the kernel"; return; }
+
+  $("subtitle").textContent = "request history";
+  total = data.total;
+  renderKpis(data.stats);
+  renderBars(data.stats.capabilities);
+  renderRows(data.rows);
+
+  const sel = $("capability");
+  if (sel.options.length === 1) {
+    for (const c of data.capabilities) sel.add(new Option(c, c));
+  }
+  $("count").textContent = total ? `${total} matching request${total === 1 ? "" : "s"}` : "";
+  $("page").textContent = total ? `${Math.min(offset + 1, total)}–${Math.min(offset + PAGE, total)} of ${total}` : "";
+  $("prev").disabled = offset === 0;
+  $("next").disabled = offset + PAGE >= total;
+}
+
+$("refresh").onclick = load;
+$("prev").onclick = () => { offset = Math.max(0, offset - PAGE); load(); };
+$("next").onclick = () => { offset += PAGE; load(); };
+for (const id of ["search", "status", "capability"]) {
+  $(id).oninput = () => { offset = 0; load(); };
+}
+let timer = null;
+$("auto").onchange = e => {
+  clearInterval(timer);
+  if (e.target.checked) timer = setInterval(load, 5000);
+};
+$("theme").onclick = () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const next = cur === "dark" ? "light" : cur === "light" ? "dark"
+    : (matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
+  document.documentElement.setAttribute("data-theme", next);
+};
+
+load();
+</script>
+</body>
+</html>

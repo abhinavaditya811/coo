@@ -24,9 +24,11 @@ import json
 import os
 import re
 import subprocess
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import history
 import sessions
 from capabilities import (CAPABILITIES, execute, CapabilityError, describe,
                           is_sensitive)
@@ -114,11 +116,55 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("[kernel]", self.address_string(), fmt % args)
 
+    def _authorized_get(self, params):
+        """Browsers can't set headers on a plain navigation, so ?token= is
+        accepted here. Read-only, and still refused without the token."""
+        if not TOKEN:
+            return True
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer ") and header[7:] == TOKEN:
+            return True
+        return params.get("token", [None])[0] == TOKEN
+
     def do_GET(self):
         self.text_mode = False  # reset: one instance serves a keep-alive connection
-        self.path = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        self.path = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+
         if self.path == "/health":
             return self._send(200, {"ok": True})
+
+        # History is sensitive — it is every request you have ever made.
+        if self.path in ("/dashboard", "/api/history"):
+            if not self._authorized_get(params):
+                return self._send(401, {"error": "unauthorized"})
+
+            if self.path == "/dashboard":
+                try:
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "dashboard.html")) as f:
+                        page = f.read().encode()
+                except OSError:
+                    return self._send(500, {"error": "dashboard.html missing"})
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                return self.wfile.write(page)
+
+            def one(name, cast=str, default=None):
+                raw = params.get(name, [None])[0]
+                return cast(raw) if raw else default
+
+            rows, total = history.recent(
+                limit=min(one("limit", int, 100), 500),
+                offset=one("offset", int, 0),
+                status=one("status"), capability=one("capability"),
+                search=one("search"))
+            return self._send(200, {"rows": rows, "total": total,
+                                    "stats": history.stats(),
+                                    "capabilities": sorted(CAPABILITIES)})
         if self.path == "/capabilities":
             listing = {
                 name: {"description": spec["description"],
@@ -129,6 +175,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        self._started = time.monotonic()
+        self._query, self._sender = "", None
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path != "/run":
             return self._send(404, {"error": "not found"})
@@ -157,6 +205,7 @@ class Handler(BaseHTTPRequestHandler):
         # Who is asking. The SMS gateway will pass the sender's number; over
         # HTTP everyone holding the token is the same principal.
         sender = str(body.get("sender") or "token")
+        self._query, self._sender = query, sender
 
         # "confirm 7QF2" releases a previously stashed sensitive action. Checked
         # before the resolver: it is a protocol word, not a capability.
@@ -164,7 +213,7 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             claimed = PENDING.claim(sender, match.group(1))
             if not claimed:
-                return self._send(200, {"status": "no_action", "message":
+                return self._log({"status": "no_action", "message":
                     "That code isn't valid — it may have expired, been used "
                     "already, or belong to a different sender."})
             capability, params = claimed
@@ -173,16 +222,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             capability, params, message = resolve(query)
         except Exception as e:  # LLM / network failure
-            return self._send(502, {"status": "error", "error": f"resolver: {e}"})
+            return self._log({"status": "error", "error": f"resolver: {e}"}, 502)
 
         if capability is None:
             # Nothing to run; relay the model's message (e.g. clarification).
-            return self._send(200, {"status": "no_action", "message": message})
+            return self._log({"status": "no_action", "message": message})
 
         # Sensitive actions never fire from the message that requested them.
         if is_sensitive(capability):
             code = PENDING.stash(sender, capability, params)
-            return self._send(200, {
+            return self._log({
                 "status": "confirmation_required",
                 "capability": capability,
                 "params": params,
@@ -193,18 +242,32 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._execute(capability, params)
 
+    def _log(self, payload, code=200):
+        """Record the outcome, then send it. Bookkeeping never blocks a reply."""
+        history.record(
+            query=getattr(self, "_query", ""),
+            sender=getattr(self, "_sender", None),
+            status=payload.get("status", "error"),
+            capability=payload.get("capability"),
+            params=payload.get("params"),
+            result=payload.get("result") or payload.get("message"),
+            error=payload.get("error"),
+            duration_ms=int((time.monotonic() - getattr(self, "_started", time.monotonic())) * 1000),
+        )
+        return self._send(code, payload)
+
     def _execute(self, capability, params):
         try:
             result = execute(capability, params)
         except CapabilityError as e:
-            return self._send(200, {"status": "error", "capability": capability,
-                                    "params": params, "error": str(e)})
+            return self._log({"status": "error", "capability": capability,
+                              "params": params, "error": str(e)})
         except Exception as e:
-            return self._send(500, {"status": "error", "capability": capability,
-                                    "error": f"unexpected: {e}"})
+            return self._log({"status": "error", "capability": capability,
+                              "error": f"unexpected: {e}"}, 500)
 
-        return self._send(200, {"status": "ok", "capability": capability,
-                                "params": params, "result": result})
+        return self._log({"status": "ok", "capability": capability,
+                          "params": params, "result": result})
 
 
 def main():
