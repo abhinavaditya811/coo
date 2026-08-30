@@ -9,3 +9,7 @@ spotify_playlists.json
 # Secrets / local env
 .env
 *.local
+
+# Generated Shortcut files embed AGENT_TOKEN — never commit them.
+*.shortcut
+AskMyMac.plist
