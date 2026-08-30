@@ -166,6 +166,15 @@ def _resolve_playlist(name):
     raise CapabilityError(f"No playlist named {name!r}. Known: {known}.")
 
 
+def playlist_names():
+    """Known playlist names, for constraining the resolver's choices. A model
+    that can only pick from real names cannot invent a placeholder."""
+    try:
+        return sorted(_playlists())
+    except CapabilityError:
+        return []
+
+
 def spotify_control(action, playlist=None):
     action = (action or "").lower().strip()
 
@@ -308,6 +317,7 @@ CAPABILITIES = {
     "music_control": {
         "description": "Control the Apple Music app (Apple's Music.app, NOT Spotify): play/pause, next, previous, or report the now-playing track.",
         "parameters": {"action": "One of: playpause, next, previous, now_playing."},
+        "choices": {"action": ["playpause", "next", "previous", "now_playing"]},
         "execute": lambda p: music_control(p["action"]),
     },
     "spotify_control": {
@@ -319,6 +329,11 @@ CAPABILITIES = {
         "parameters": {
             "action": "One of: play_playlist, playpause, next, previous, now_playing.",
             "playlist?": "Playlist name; required when action is play_playlist.",
+        },
+        # Constrains the model to real values instead of invented placeholders.
+        "choices": {
+            "action": ["play_playlist", "playpause", "next", "previous", "now_playing"],
+            "playlist": playlist_names,
         },
         "execute": lambda p: spotify_control(p["action"], p.get("playlist")),
     },
@@ -352,6 +367,15 @@ def execute(capability, params):
     if not spec:
         raise CapabilityError(f"Unknown capability: {capability!r}")
     return spec["execute"](params or {})
+
+
+def choices_for(capability, param):
+    """Allowed values for a parameter, or None if it is free-form. A value may
+    be a callable so the list can reflect current state (e.g. playlists)."""
+    opts = (CAPABILITIES.get(capability) or {}).get("choices", {}).get(param)
+    if callable(opts):
+        opts = opts()
+    return list(opts) if opts else None
 
 
 def is_sensitive(capability):

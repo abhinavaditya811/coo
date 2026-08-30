@@ -25,7 +25,7 @@ import re
 import urllib.error
 import urllib.request
 
-from capabilities import CAPABILITIES, parse_command
+from capabilities import CAPABILITIES, choices_for, parse_command
 
 try:
     import anthropic
@@ -43,27 +43,42 @@ MODEL = os.environ.get("AGENT_MODEL")
 # Shared: describe the registry for the model
 # ---------------------------------------------------------------------------
 
-def _params_desc(spec):
+def _params_desc(spec, name=None):
     out = []
     for key, desc in spec["parameters"].items():
-        optional = key.endswith("?")
-        out.append(f"{key.rstrip('?')}{' (optional)' if optional else ''}: {desc}")
+        param = key.rstrip("?")
+        opts = choices_for(name, param) if name else None
+        if opts:
+            desc = f"{desc} Allowed values: {', '.join(repr(o) for o in opts)}."
+        out.append(f"{param}{' (optional)' if key.endswith('?') else ''}: {desc}")
     return "; ".join(out) or "none"
 
 
 def _capability_spec():
     return "\n".join(
-        f"- {name}: {spec['description']} | params: {_params_desc(spec)}"
+        f"- {name}: {spec['description']} | params: {_params_desc(spec, name)}"
         for name, spec in CAPABILITIES.items()
     )
 
 
 SYSTEM_PROMPT = (
     "You control a Mac by mapping the user's request to exactly one capability "
-    "and its parameters. Choose the single best fit. If nothing fits, use "
-    'capability "none" and explain briefly in "message". Only include parameters '
-    "that were actually provided; omit optional ones you don't have.\n\n"
-    "Capabilities:\n{spec}"
+    "and its parameters. Choose the single best fit.\n\n"
+    "Fill each parameter with the user's OWN WORDS, copied from their request. "
+    "Never invent a placeholder: values like <name>, your_playlist_name, or "
+    "example@email.com are always wrong. If a required value is genuinely absent "
+    'from the request, use capability "none" and say what is missing in '
+    '"message". Omit optional parameters you weren\'t given.\n\n'
+    "Capabilities:\n{spec}\n\n"
+    "Examples:\n"
+    "request: play my playlist chill on spotify\n"
+    '{{"capability":"spotify_control","params":'
+    '{{"action":"play_playlist","playlist":"chill"}}}}\n'
+    "request: text Sam that I am late\n"
+    '{{"capability":"send_imessage","params":'
+    '{{"recipient":"Sam","body":"I am late"}}}}\n'
+    "request: open notes\n"
+    '{{"capability":"open_app","params":{{"app_name":"Notes"}}}}'
 )
 
 
@@ -71,20 +86,50 @@ SYSTEM_PROMPT = (
 # OpenAI-compatible provider (llama.cpp / Ollama / LM Studio / Groq / ...)
 # ---------------------------------------------------------------------------
 
+def _param_schema(capability, param, desc):
+    node = {"type": "string", "description": desc}
+    opts = choices_for(capability, param)
+    if opts:
+        # An enum makes an invented placeholder structurally impossible.
+        node["enum"] = opts
+    return node
+
+
 def _json_schema():
-    return {
-        "type": "object",
-        "properties": {
-            "capability": {
-                "type": "string",
-                "enum": list(CAPABILITIES.keys()) + ["none"],
+    """One branch per capability, each pinning its own params.
+
+    A single `{"params": {"type": "object"}}` left the model free to invent
+    values, which is how placeholders like "<your_playlist_name>" and dropped
+    required parameters got through. Naming the properties per capability and
+    marking the required ones lets the grammar enforce what the prose only asked
+    for."""
+    branches = []
+    for name, spec in CAPABILITIES.items():
+        props, required = {}, []
+        for pname, pdesc in spec["parameters"].items():
+            key = pname.rstrip("?")
+            props[key] = _param_schema(name, key, pdesc)
+            if not pname.endswith("?"):
+                required.append(key)
+        branches.append({
+            "type": "object",
+            "properties": {
+                "capability": {"const": name},
+                "params": {"type": "object", "properties": props,
+                           "required": required, "additionalProperties": False},
             },
-            "params": {"type": "object"},
-            "message": {"type": "string"},
-        },
+            "required": ["capability", "params"],
+            "additionalProperties": False,
+        })
+    branches.append({
+        "type": "object",
+        "properties": {"capability": {"const": "none"},
+                       "params": {"type": "object"},
+                       "message": {"type": "string"}},
         "required": ["capability", "params"],
         "additionalProperties": False,
-    }
+    })
+    return {"anyOf": branches}
 
 
 def _post(url, body):
@@ -154,7 +199,7 @@ def build_tools():
         props, required = {}, []
         for pname, pdesc in spec["parameters"].items():
             key = pname.rstrip("?")
-            props[key] = {"type": "string", "description": pdesc}
+            props[key] = _param_schema(name, key, pdesc)
             if not pname.endswith("?"):
                 required.append(key)
         tools.append({
@@ -185,6 +230,36 @@ def _resolve_anthropic(query):
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Values a model emits when it is echoing the schema instead of reading the
+# request. Executing one of these is always wrong — better to say so.
+_PLACEHOLDER_RE = re.compile(
+    r"^<.*>$"                                  # <name>, <your_playlist_name>
+    r"|^\{\{?.*\}\}?$"                         # {name}, {{name}}
+    r"|your[_ ](name|number|playlist|email|phone|app|text|message)"
+    r"|(playlist|app|user|file|recipient)[_ ]name$"
+    r"|^(placeholder|example|foo|bar|xxx+|todo|tbd|n/a|none|null)$"
+    r"|example\.(com|org)$",
+    re.IGNORECASE)
+
+
+def _placeholders(params):
+    return [k for k, v in (params or {}).items()
+            if isinstance(v, str) and _PLACEHOLDER_RE.search(v.strip())]
+
+
+def _validated(capability, params, message):
+    """Reject a resolution that filled parameters with schema echoes."""
+    if capability is None:
+        return capability, params, message
+    bad = _placeholders(params)
+    if bad:
+        names = ", ".join(bad)
+        return None, None, (
+            f"I couldn't tell what you meant for: {names}. "
+            "Please say the exact value.")
+    return capability, params, message
+
+
 def _fallback(query, why):
     name, params = parse_command(query)
     if name:
@@ -202,13 +277,13 @@ def resolve(query):
         if anthropic is None or not ANTHROPIC_API_KEY:
             return _fallback(query, "Anthropic provider not configured.")
         try:
-            return _resolve_anthropic(query)
+            return _validated(*_resolve_anthropic(query))
         except Exception as e:
             return _fallback(query, f"Anthropic call failed: {e}.")
 
     if provider == "openai":
         try:
-            return _resolve_openai(query)
+            return _validated(*_resolve_openai(query))
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
             return _fallback(
                 query,
