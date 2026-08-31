@@ -81,6 +81,26 @@ SYSTEM_PROMPT = (
     '{{"capability":"open_app","params":{{"app_name":"Notes"}}}}'
 )
 
+PLAN_RULES = (
+    # NB: this string is concatenated AFTER SYSTEM_PROMPT.format(), so braces
+    # here are literal — do not double them.
+    "\n\nReturn an ordered list in \"steps\". Almost every request is ONE step. "
+    "Use more than one ONLY when the user asks for several clearly distinct "
+    "actions. A word like \"and\" inside a message you have been asked to send "
+    "is part of that message, not a second action.\n\n"
+    "If a step needs the RESULT of an earlier step, put {{stepN}} in that "
+    "parameter, where N is the 1-based position of the earlier step. Write it "
+    "exactly like that, with two braces on each side, and refer only to a step "
+    "that comes before the one using it.\n\n"
+    "request: open safari and pause spotify\n"
+    '{"steps":[{"capability":"open_app","params":{"app_name":"Safari"}},'
+    '{"capability":"spotify_control","params":{"action":"playpause"}}]}\n'
+    "request: read my clipboard and text it to Sam\n"
+    '{"steps":[{"capability":"get_clipboard","params":{}},'
+    '{"capability":"send_imessage","params":'
+    '{"recipient":"Sam","body":"{{step1}}"}}]}'
+)
+
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible provider (llama.cpp / Ollama / LM Studio / Groq / ...)
@@ -93,6 +113,53 @@ def _param_schema(capability, param, desc):
         # An enum makes an invented placeholder structurally impossible.
         node["enum"] = opts
     return node
+
+
+MAX_STEPS = 4        # bounds the blast radius of a bad decomposition
+STEP_REF_RE = re.compile(r"\{\{step(\d+)\}\}")
+
+
+def _capability_branches():
+    branches = []
+    for name, spec in CAPABILITIES.items():
+        props, required = {}, []
+        for pname, pdesc in spec["parameters"].items():
+            key = pname.rstrip("?")
+            props[key] = _param_schema(name, key, pdesc)
+            if not pname.endswith("?"):
+                required.append(key)
+        branches.append({
+            "type": "object",
+            "properties": {
+                "capability": {"const": name},
+                "params": {"type": "object", "properties": props,
+                           "required": required, "additionalProperties": False},
+            },
+            "required": ["capability", "params"],
+            "additionalProperties": False,
+        })
+    branches.append({
+        "type": "object",
+        "properties": {"capability": {"const": "none"},
+                       "params": {"type": "object"},
+                       "message": {"type": "string"}},
+        "required": ["capability", "params"],
+        "additionalProperties": False,
+    })
+    return branches
+
+
+def _plan_schema():
+    """A request is an ordered list of capability calls — usually one."""
+    return {
+        "type": "object",
+        "properties": {
+            "steps": {"type": "array", "items": {"anyOf": _capability_branches()},
+                      "minItems": 1, "maxItems": MAX_STEPS},
+            "message": {"type": "string"},
+        },
+        "required": ["steps"],
+    }
 
 
 def _json_schema():
@@ -159,7 +226,7 @@ def _extract_json(text):
 
 def _resolve_openai(query):
     url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
-    system = SYSTEM_PROMPT.format(spec=_capability_spec())
+    system = SYSTEM_PROMPT.format(spec=_capability_spec()) + PLAN_RULES
     base = {
         "model": MODEL or "local-model",
         "messages": [{"role": "system", "content": system},
@@ -171,8 +238,8 @@ def _resolve_openai(query):
     try:
         payload = _post(url, dict(base, response_format={
             "type": "json_schema",
-            "json_schema": {"name": "capability_call",
-                            "schema": _json_schema(), "strict": True},
+            "json_schema": {"name": "plan",
+                            "schema": _plan_schema(), "strict": True},
         }))
     except urllib.error.HTTPError:
         payload = _post(url, dict(base, response_format={"type": "json_object"}))
@@ -180,13 +247,26 @@ def _resolve_openai(query):
     content = payload["choices"][0]["message"]["content"]
     obj = _extract_json(content)
 
-    cap = obj.get("capability")
-    params = obj.get("params") or {}
-    if cap in (None, "", "none"):
-        return None, None, obj.get("message") or "I couldn't map that to anything I can do."
-    if cap not in CAPABILITIES:
-        return None, None, f"Model chose an unknown capability: {cap!r}."
-    return cap, params, None
+    # Older servers that ignored the plan schema may still return a bare call.
+    raw = obj.get("steps")
+    if raw is None:
+        raw = [obj] if obj.get("capability") else []
+
+    steps = []
+    for item in raw[:MAX_STEPS]:
+        cap = (item or {}).get("capability")
+        if cap in (None, "", "none"):
+            continue
+        if cap not in CAPABILITIES:
+            return None, f"Model chose an unknown capability: {cap!r}."
+        steps.append({"capability": cap, "params": (item.get("params") or {})})
+
+    if not steps:
+        message = obj.get("message")
+        if not message and raw:
+            message = (raw[0] or {}).get("message")
+        return None, message or "I couldn't map that to anything I can do."
+    return steps, None
 
 
 # ---------------------------------------------------------------------------
@@ -215,15 +295,16 @@ def _resolve_anthropic(query):
     msg = client.messages.create(
         model=MODEL or "claude-haiku-4-5",
         max_tokens=1024,
-        system=SYSTEM_PROMPT.format(spec=_capability_spec()),
+        system=SYSTEM_PROMPT.format(spec=_capability_spec()) + PLAN_RULES,
         tools=build_tools(),
         messages=[{"role": "user", "content": query}],
     )
-    for block in msg.content:
-        if block.type == "tool_use":
-            return block.name, dict(block.input), None
+    steps = [{"capability": b.name, "params": dict(b.input)}
+             for b in msg.content if b.type == "tool_use"][:MAX_STEPS]
+    if steps:
+        return steps, None
     text = "".join(b.text for b in msg.content if b.type == "text").strip()
-    return None, None, (text or "I couldn't map that to anything I can do.")
+    return None, (text or "I couldn't map that to anything I can do.")
 
 
 # ---------------------------------------------------------------------------
@@ -243,34 +324,47 @@ _PLACEHOLDER_RE = re.compile(
 
 
 def _placeholders(params):
+    """{{stepN}} is our own reference syntax, not a model-invented placeholder."""
     return [k for k, v in (params or {}).items()
-            if isinstance(v, str) and _PLACEHOLDER_RE.search(v.strip())]
+            if isinstance(v, str)
+            and not STEP_REF_RE.search(v)
+            and _PLACEHOLDER_RE.search(v.strip())]
 
 
-def _validated(capability, params, message):
-    """Reject a resolution that filled parameters with schema echoes."""
-    if capability is None:
-        return capability, params, message
-    bad = _placeholders(params)
-    if bad:
-        names = ", ".join(bad)
-        return None, None, (
-            f"I couldn't tell what you meant for: {names}. "
-            "Please say the exact value.")
-    return capability, params, message
+def _validated(steps, message):
+    """Reject a plan whose parameters are schema echoes or bad step references."""
+    if steps is None:
+        return steps, message
+    for i, step in enumerate(steps, start=1):
+        bad = _placeholders(step["params"])
+        if bad:
+            return None, (f"I couldn't tell what you meant for: {', '.join(bad)}. "
+                          "Please say the exact value.")
+        for key, value in step["params"].items():
+            if not isinstance(value, str):
+                continue
+            for ref in STEP_REF_RE.findall(value):
+                n = int(ref)
+                # A step may only consume a result that already exists.
+                if n < 1 or n >= i:
+                    return None, (
+                        f"Step {i} refers to step {n}, which doesn't come before "
+                        "it. Try asking for the two things separately.")
+    return steps, message
 
 
 def _fallback(query, why):
     name, params = parse_command(query)
     if name:
-        return name, params, None
-    return None, None, (
+        return [{"capability": name, "params": params}], None
+    return None, (
         f"{why} You can use a structured command like `open_app app_name=Safari`."
     )
 
 
 def resolve(query):
-    """Return (capability, params, message). If capability is None, show message."""
+    """Return (steps, message). steps is an ordered list of
+    {"capability", "params"}; None means nothing to run — show the message."""
     provider = PROVIDER or "openai"
 
     if provider == "anthropic":

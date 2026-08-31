@@ -16,6 +16,7 @@ Standard library only, in-memory: pending actions are meant to die with the
 process. A restart cancelling an unconfirmed send is the safe failure.
 """
 
+import copy
 import secrets
 import threading
 import time
@@ -34,10 +35,10 @@ class PendingStore:
         self._ttl = ttl
         self._clock = clock
         self._lock = threading.Lock()
-        self._pending = {}  # code -> (sender, capability, params, expires_at)
+        self._pending = {}  # code -> (sender, plan, expires_at)
 
     def _purge(self, now):
-        for code in [c for c, (_, _, _, exp) in self._pending.items() if exp <= now]:
+        for code in [c for c, (_, _, exp) in self._pending.items() if exp <= now]:
             del self._pending[code]
 
     def _new_code(self):
@@ -46,25 +47,25 @@ class PendingStore:
             if code not in self._pending:
                 return code
 
-    def stash(self, sender, capability, params):
-        """Hold an action and return the code needed to release it."""
+    def stash(self, sender, plan):
+        """Hold a plan (a list of steps) and return the code that releases it."""
         with self._lock:
             now = self._clock()
             self._purge(now)
             # A sender asking again supersedes their own earlier request, so an
             # abandoned code can't be confirmed by accident later.
-            for code in [c for c, (s, _, _, _) in self._pending.items() if s == sender]:
+            for code in [c for c, (s, _, _) in self._pending.items() if s == sender]:
                 del self._pending[code]
             if len(self._pending) >= MAX_PENDING:
-                oldest = min(self._pending, key=lambda c: self._pending[c][3])
+                oldest = min(self._pending, key=lambda c: self._pending[c][2])
                 del self._pending[oldest]
             code = self._new_code()
-            self._pending[code] = (sender, capability, dict(params or {}),
-                                   now + self._ttl)
+            # Deep copy: a pending plan must not change after you were shown it.
+            self._pending[code] = (sender, copy.deepcopy(list(plan)), now + self._ttl)
             return code
 
     def claim(self, sender, code):
-        """Consume a code. Returns (capability, params), or None if the code is
+        """Consume a code. Returns the stashed plan, or None if the code is
         unknown, expired, already used, or belongs to a different sender."""
         with self._lock:
             now = self._clock()
@@ -72,11 +73,11 @@ class PendingStore:
             entry = self._pending.get(code.upper())
             if not entry:
                 return None
-            owner, capability, params, _ = entry
+            owner, plan, _ = entry
             if owner != sender:
                 return None
             del self._pending[code.upper()]
-            return capability, params
+            return plan
 
     def __len__(self):
         with self._lock:

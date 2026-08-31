@@ -4,15 +4,18 @@ Guidance for AI assistants (and humans) working on **Coo**. For the *why* behind
 all of this, read `DESIGN.md`.
 
 ## What this is
-`Coo` runs on a Mac, takes a natural-language request, maps it to **one
-pre-defined capability**, runs the AppleScript/shell for it, and returns the result
-over HTTP. The iPhone (and later an SMS gateway) is just a client that POSTs a query;
+`Coo` runs on a Mac, takes a natural-language request, maps it to an ordered
+**plan of one or more pre-defined capabilities**, runs the AppleScript/shell for
+each, and returns the results over HTTP. Most requests are a single step. The iPhone (and later an SMS gateway) is just a client that POSTs a query;
 the Mac is where things actually happen.
 
 ## Repo layout
 - `kernel.py` — HTTP server and the main loop: auth → resolve → execute → respond. Entry point.
 - `capabilities.py` — the capability registry plus each injection-safe executor.
-- `resolver.py` — natural language → `(capability, params)` via Claude tool-calling, with a no-LLM structured-command fallback.
+- `resolver.py` — natural language → an ordered plan of `(capability, params)`
+  steps, with a no-LLM structured-command fallback.
+- `sessions.py` — short-lived pending confirmations for sensitive plans.
+- `history.py` — SQLite record of every request, behind the dashboard.
 - `spotify_sync.py` — one-off helper: OAuth (PKCE) to the Spotify Web API to
   populate `spotify_playlists.json`. Never imported by the kernel; keeps the
   network out of the request path.
@@ -44,9 +47,10 @@ structured-command syntax, so the executor and registry can be exercised without
 running model.
 
 ## Invariants — do not break these
-1. **The LLM never writes or runs code.** It only selects a capability name and
-   fills parameters. All execution flows through `capabilities.CAPABILITIES`. Never
-   add a path that runs arbitrary model-generated osascript or shell.
+1. **The LLM never writes or runs code.** It only selects capability names and
+   fills parameters (now as a list of steps, capped at `resolver.MAX_STEPS`). All
+   execution flows through `capabilities.CAPABILITIES`. Never add a path that runs
+   arbitrary model-generated osascript or shell.
 2. **Injection safety.** User/model values go to osascript as `argv` items (scripts
    use `on run argv`) or to `subprocess` as an argv list. Never string-interpolate
    values into a script body and never use `shell=True`.
@@ -75,6 +79,14 @@ Apple Music, `spotify_control` drives Spotify. Their descriptions say so
 explicitly because the resolver picks by description alone — a vague one sends
 "play my Spotify playlist" to Apple Music.
 
+## Multi-step plans
+`resolve()` returns a list of steps. A step may consume an earlier step's output
+by putting `{{stepN}}` in a parameter (1-based, must refer to an *earlier* step —
+`resolver._validated` rejects anything else). The kernel runs steps in order and
+keeps going after a failure, except that a step whose referenced result is
+missing is **skipped**, never run with a blank value. If any step is sensitive
+the whole plan is held for one confirmation code.
+
 ## Conventions
 - Standard library only in `kernel.py` and `capabilities.py`; `anthropic` is
   confined to `resolver.py`.
@@ -90,8 +102,8 @@ explicitly because the resolver picks by description alone — a vague one sends
   provider (local llama.cpp/Qwen by default, Claude as fallback).
 - **Built:** iPhone Shortcut → HTTP over Tailscale (tailnet-only binding,
   `?format=text` replies, LaunchAgent autostart).
-- **Next:** confirmation flow for sensitive actions. NOTE: the `sensitive` flag
-  is described in DESIGN.md but is **not implemented** — `send_imessage`
-  currently executes immediately.
+- **Built:** confirmation flow (`sensitive` flag + `sessions.py`); request
+  history + dashboard; multi-step plans with `{{stepN}}` chaining.
+- **Next:** SMS gateway (offline channel).
 - **Later:** confirmation flow (designed in DESIGN.md), SMS gateway (offline
   channel), iPhone-side execution.

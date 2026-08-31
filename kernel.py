@@ -29,6 +29,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import history
+import resolver
 import sessions
 from capabilities import (CAPABILITIES, execute, CapabilityError, describe,
                           is_sensitive)
@@ -216,31 +217,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._log({"status": "no_action", "message":
                     "That code isn't valid — it may have expired, been used "
                     "already, or belong to a different sender."})
-            capability, params = claimed
-            return self._execute(capability, params)
+            return self._run_plan(claimed)
 
         try:
-            capability, params, message = resolve(query)
+            steps, message = resolve(query)
         except Exception as e:  # LLM / network failure
             return self._log({"status": "error", "error": f"resolver: {e}"}, 502)
 
-        if capability is None:
+        if not steps:
             # Nothing to run; relay the model's message (e.g. clarification).
             return self._log({"status": "no_action", "message": message})
 
-        # Sensitive actions never fire from the message that requested them.
-        if is_sensitive(capability):
-            code = PENDING.stash(sender, capability, params)
+        # If any step is sensitive the whole plan waits: you see every action
+        # before any of it happens, and one code releases all of them.
+        if any(is_sensitive(s["capability"]) for s in steps):
+            code = PENDING.stash(sender, steps)
+            lines = "; ".join(f"{i}. {describe(s['capability'], s['params'])}"
+                              for i, s in enumerate(steps, start=1))
+            what = lines if len(steps) > 1 else describe(steps[0]["capability"],
+                                                         steps[0]["params"])
             return self._log({
                 "status": "confirmation_required",
-                "capability": capability,
-                "params": params,
+                "steps": steps,
                 "code": code,
-                "message": f'About to {describe(capability, params)}. '
-                           f'Reply "confirm {code}" to send.',
+                "message": f'About to {what}. Reply "confirm {code}" to run.',
             })
 
-        return self._execute(capability, params)
+        return self._run_plan(steps)
 
     def _log(self, payload, code=200):
         """Record the outcome, then send it. Bookkeeping never blocks a reply."""
@@ -256,18 +259,73 @@ class Handler(BaseHTTPRequestHandler):
         )
         return self._send(code, payload)
 
-    def _execute(self, capability, params):
-        try:
-            result = execute(capability, params)
-        except CapabilityError as e:
-            return self._log({"status": "error", "capability": capability,
-                              "params": params, "error": str(e)})
-        except Exception as e:
-            return self._log({"status": "error", "capability": capability,
-                              "error": f"unexpected: {e}"}, 500)
+    def _run_plan(self, steps):
+        """Run steps in order. A step's {{stepN}} is replaced by step N's
+        result. Steps are independent unless they reference each other, so a
+        failure doesn't stop the rest — except where a later step needed the
+        result the failed step never produced."""
+        outcomes, results = [], {}
 
-        return self._log({"status": "ok", "capability": capability,
-                          "params": params, "result": result})
+        for i, step in enumerate(steps, start=1):
+            capability, params = step["capability"], dict(step["params"])
+
+            missing = sorted({int(n) for v in params.values()
+                              if isinstance(v, str)
+                              for n in resolver.STEP_REF_RE.findall(v)} - set(results))
+            if missing:
+                outcomes.append({
+                    "step": i, "capability": capability, "params": params,
+                    "status": "skipped",
+                    "error": f"needed the result of step {missing[0]}, which failed",
+                })
+                continue
+
+            for key, value in params.items():
+                if isinstance(value, str):
+                    params[key] = resolver.STEP_REF_RE.sub(
+                        lambda m: results[int(m.group(1))], value)
+
+            try:
+                result = execute(capability, params)
+                results[i] = result
+                outcomes.append({"step": i, "capability": capability,
+                                 "params": params, "status": "ok", "result": result})
+            except CapabilityError as e:
+                outcomes.append({"step": i, "capability": capability,
+                                 "params": params, "status": "error", "error": str(e)})
+            except Exception as e:
+                outcomes.append({"step": i, "capability": capability,
+                                 "params": params, "status": "error",
+                                 "error": f"unexpected: {e}"})
+
+        for o in outcomes:
+            history.record(query=getattr(self, "_query", ""),
+                           sender=getattr(self, "_sender", None),
+                           status=o["status"], capability=o["capability"],
+                           params=o["params"], result=o.get("result"),
+                           error=o.get("error"),
+                           duration_ms=int((time.monotonic() -
+                                            getattr(self, "_started", time.monotonic())) * 1000))
+
+        summary = " ".join(
+            o["result"] if o["status"] == "ok" else "Error: " + o["error"]
+            for o in outcomes)
+        failed = [o for o in outcomes if o["status"] != "ok"]
+        payload = {
+            "status": "ok" if not failed else ("error" if len(failed) == len(outcomes)
+                                               else "partial"),
+            "steps": outcomes,
+            "result": summary,
+        }
+        if len(outcomes) == 1:
+            # Keep the single-step response shape stable for existing clients.
+            o = outcomes[0]
+            payload["capability"], payload["params"] = o["capability"], o["params"]
+            if o["status"] == "ok":
+                payload["result"] = o["result"]
+            else:
+                payload["error"] = o["error"]
+        return self._send(200, payload)
 
 
 def main():
