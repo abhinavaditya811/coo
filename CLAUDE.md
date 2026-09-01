@@ -10,7 +10,16 @@ each, and returns the results over HTTP. Most requests are a single step. The iP
 the Mac is where things actually happen.
 
 ## Repo layout
-- `kernel.py` — HTTP server and the main loop: auth → resolve → execute → respond. Entry point.
+- `kernel.py` — entry point only. `AGENT_ROLE` (all | edge | mac) picks which
+  half starts; `all` is the default and runs both on one machine.
+- `edge.py` — the always-on front door: auth, pending confirmations, history,
+  dashboard, and the degraded reply when the Mac is unreachable. Owns no
+  capabilities and no model.
+- `macnode.py` — the Mac half: `/resolve` (annotated plan) and `/execute` (one
+  step). Tailnet-only, authenticated with `MAC_TOKEN`.
+- `macclient.py` — the edge's client for the node; owns reachability state.
+- `netutil.py` — shared binding, auth, and JSON transport helpers.
+- `plan.py` — plan execution with the executor injected (local or over HTTP).
 - `capabilities.py` — the capability registry plus each injection-safe executor.
 - `resolver.py` — natural language → an ordered plan of `(capability, params)`
   steps, with a no-LLM structured-command fallback.
@@ -60,6 +69,13 @@ running model.
    Tailscale tailnet. `AGENT_HOST=tailscale` binds solely to the `100.x` address
    and fails closed if the tailnet is down — prefer it to `0.0.0.0`. Never add or
    document a public internet port-forward.
+5. **Split trust.** `edge.py` never imports `capabilities` or `resolver` — it has
+   no capability knowledge and gates confirmations purely on the `sensitive` and
+   `describe` fields the Mac annotates. `macnode.py` never imports `history`,
+   `sessions`, or `plan`. Two separate tokens: `AGENT_TOKEN` (client→edge) and
+   `MAC_TOKEN` (edge→node). Note the gate now lives on the edge while the node
+   executes on trust, so a compromised edge can bypass confirmation — the
+   control for that is a Tailscale ACL scoping the edge to the node's port.
 
 ## Adding a capability
 1. Write an executor in `capabilities.py` that takes explicit args and returns a

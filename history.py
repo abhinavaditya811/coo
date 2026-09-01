@@ -95,6 +95,21 @@ def recent(limit=100, offset=0, status=None, capability=None, search=None):
     return [dict(r) for r in rows], total
 
 
+def seen_capabilities():
+    """Capabilities that actually appear in history.
+
+    The dashboard filter used to read the live registry, which coupled the
+    always-on edge to capability metadata it otherwise never needs. This is also
+    more truthful: it lists what has been used, including retired capabilities.
+    """
+    with _lock:
+        conn = _connect()
+        rows = conn.execute(
+            "SELECT DISTINCT capability FROM requests"
+            " WHERE capability IS NOT NULL ORDER BY capability").fetchall()
+    return [r["capability"] for r in rows]
+
+
 def stats():
     with _lock:
         conn = _connect()
@@ -103,7 +118,8 @@ def stats():
             " SUM(status = 'ok') AS ok,"
             " SUM(status = 'error') AS errors,"
             " SUM(status = 'confirmation_required') AS confirmations,"
-            " SUM(status = 'no_action') AS no_action"
+            " SUM(status = 'no_action') AS no_action,"
+            " SUM(status = 'unavailable') AS unavailable"
             " FROM requests").fetchone()
         caps = conn.execute(
             "SELECT capability, COUNT(*) AS n FROM requests"
@@ -122,6 +138,7 @@ def stats():
         "errors": row["errors"] or 0,
         "confirmations": row["confirmations"] or 0,
         "no_action": row["no_action"] or 0,
+        "unavailable": row["unavailable"] or 0,
         "median_ms": median,
         "capabilities": [{"capability": r["capability"], "count": r["n"]} for r in caps],
     }

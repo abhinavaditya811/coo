@@ -71,7 +71,7 @@
   }
 
   /* ---- KPI row: hero numbers, no plot ---- */
-  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+  .kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 14px; }
   .kpi-label { color: var(--text-secondary); font-size: 12px; letter-spacing: 0.02em; text-transform: uppercase; }
   .kpi-value { font-size: 27px; font-weight: 600; margin-top: 5px; letter-spacing: -0.02em;
                font-variant-numeric: tabular-nums; }
@@ -158,6 +158,7 @@
       <option value="error">error</option>
       <option value="confirmation_required">confirmation_required</option>
       <option value="no_action">no_action</option>
+      <option value="unavailable">unavailable (mac offline)</option>
     </select>
     <select id="capability"><option value="">All capabilities</option></select>
     <span class="spacer"></span>
@@ -196,6 +197,10 @@ const STATUS = {
   error:                 { cls: "s-error",   icon: "✕", label: "error" },
   confirmation_required: { cls: "s-confirm", icon: "!", label: "awaiting confirm" },
   no_action:             { cls: "s-none",    icon: "–", label: "no action" },
+  // Muted rather than a fourth status hue: adding one would break the
+  // validated CVD separation of the good/warning/critical set. The icon and
+  // label carry the distinction, so it never rests on colour alone.
+  unavailable:           { cls: "s-none",    icon: "⚠", label: "mac offline" },
 };
 
 function chip(status) {
@@ -221,6 +226,8 @@ function renderKpis(st) {
       note: `${st.ok} ok · ${st.errors} error${st.errors === 1 ? "" : "s"}` },
     { label: "Awaiting confirm", value: st.confirmations,
       note: "sensitive actions held" },
+    { label: "Mac offline",    value: st.unavailable ?? 0,
+      note: "requests that couldn't reach the Mac" },
     { label: "Median latency", value: st.median_ms === null ? "—" : st.median_ms + " ms",
       note: "median, not mean" },
   ];
