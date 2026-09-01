@@ -115,8 +115,9 @@ def _param_schema(capability, param, desc):
     return node
 
 
-MAX_STEPS = 4        # bounds the blast radius of a bad decomposition
-STEP_REF_RE = re.compile(r"\{\{step(\d+)\}\}")
+# Owned by plan.py (the executor needs them too); re-exported so existing
+# callers of resolver.MAX_STEPS / resolver.STEP_REF_RE keep working.
+from plan import MAX_STEPS, STEP_REF_RE  # noqa: E402
 
 
 def _capability_branches():

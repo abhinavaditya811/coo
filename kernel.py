@@ -19,59 +19,25 @@ Endpoints:
                            as an "Authorization: Bearer ..." header)
 """
 
-import ipaddress
 import json
 import os
 import re
-import subprocess
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 
 import history
-import resolver
+import netutil
+import plan
 import sessions
-from capabilities import (CAPABILITIES, execute, CapabilityError, describe,
-                          is_sensitive)
+from capabilities import CAPABILITIES, execute, describe, is_sensitive
 from resolver import resolve
 
 PORT = int(os.environ.get("AGENT_PORT", "8765"))
 TOKEN = os.environ.get("AGENT_TOKEN")
 
-# Tailscale hands out addresses from the CGNAT range 100.64.0.0/10.
-_TAILNET = ipaddress.ip_network("100.64.0.0/10")
-
-
-def tailnet_ip():
-    """This Mac's Tailscale address, or None if it isn't on a tailnet."""
-    try:
-        out = subprocess.run(["ifconfig"], capture_output=True, text=True,
-                             timeout=5).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    for addr in re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out):
-        try:
-            if ipaddress.ip_address(addr) in _TAILNET:
-                return addr
-        except ValueError:
-            continue
-    return None
-
-
-def resolve_host(value):
-    """AGENT_HOST=tailscale binds only to the tailnet address, so joining an
-    untrusted Wi-Fi never exposes the kernel the way 0.0.0.0 would."""
-    if value.lower() in ("tailscale", "tailnet"):
-        ip = tailnet_ip()
-        if not ip:
-            raise SystemExit(
-                "AGENT_HOST=tailscale but this Mac has no Tailscale address.\n"
-                "Start Tailscale.app and sign in, then try again.")
-        return ip
-    return value
-
-
-HOST = resolve_host(os.environ.get("AGENT_HOST", "127.0.0.1"))
+HOST = netutil.resolve_host(os.environ.get("AGENT_HOST", "127.0.0.1"),
+                            "kernel")
 
 # Pending confirmations for sensitive capabilities.
 PENDING = sessions.PendingStore()
@@ -82,10 +48,9 @@ CONFIRM_RE = re.compile(r"^\s*confirm\s+([A-Za-z0-9]{%d})\s*$" % sessions.CODE_L
 def _authorized(handler, body):
     if not TOKEN:
         return True  # no token set -> local-only, unauthenticated (dev mode)
-    header = handler.headers.get("Authorization", "")
-    if header.startswith("Bearer ") and header[7:] == TOKEN:
+    if netutil.token_matches(netutil.bearer_token(handler.headers), TOKEN):
         return True
-    return body.get("token") == TOKEN
+    return netutil.token_matches(body.get("token"), TOKEN)
 
 
 def as_text(payload):
@@ -97,7 +62,9 @@ def as_text(payload):
     return "Error: " + str(payload.get("error", "something went wrong."))
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(netutil.JSONHandler):
+    log_prefix = "[kernel]"
+
     # Set per-request; when true, responses are plain text instead of JSON.
     text_mode = False
 
@@ -114,18 +81,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def log_message(self, fmt, *args):
-        print("[kernel]", self.address_string(), fmt % args)
-
     def _authorized_get(self, params):
         """Browsers can't set headers on a plain navigation, so ?token= is
         accepted here. Read-only, and still refused without the token."""
         if not TOKEN:
             return True
-        header = self.headers.get("Authorization", "")
-        if header.startswith("Bearer ") and header[7:] == TOKEN:
+        if netutil.token_matches(netutil.bearer_token(self.headers), TOKEN):
             return True
-        return params.get("token", [None])[0] == TOKEN
+        return netutil.token_matches(params.get("token", [None])[0], TOKEN)
 
     def do_GET(self):
         self.text_mode = False  # reset: one instance serves a keep-alive connection
@@ -260,43 +223,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(code, payload)
 
     def _run_plan(self, steps):
-        """Run steps in order. A step's {{stepN}} is replaced by step N's
-        result. Steps are independent unless they reference each other, so a
-        failure doesn't stop the rest — except where a later step needed the
-        result the failed step never produced."""
-        outcomes, results = [], {}
-
-        for i, step in enumerate(steps, start=1):
-            capability, params = step["capability"], dict(step["params"])
-
-            missing = sorted({int(n) for v in params.values()
-                              if isinstance(v, str)
-                              for n in resolver.STEP_REF_RE.findall(v)} - set(results))
-            if missing:
-                outcomes.append({
-                    "step": i, "capability": capability, "params": params,
-                    "status": "skipped",
-                    "error": f"needed the result of step {missing[0]}, which failed",
-                })
-                continue
-
-            for key, value in params.items():
-                if isinstance(value, str):
-                    params[key] = resolver.STEP_REF_RE.sub(
-                        lambda m: results[int(m.group(1))], value)
-
-            try:
-                result = execute(capability, params)
-                results[i] = result
-                outcomes.append({"step": i, "capability": capability,
-                                 "params": params, "status": "ok", "result": result})
-            except CapabilityError as e:
-                outcomes.append({"step": i, "capability": capability,
-                                 "params": params, "status": "error", "error": str(e)})
-            except Exception as e:
-                outcomes.append({"step": i, "capability": capability,
-                                 "params": params, "status": "error",
-                                 "error": f"unexpected: {e}"})
+        """Execute a plan locally and record every step."""
+        outcomes = plan.run(steps, execute)
 
         for o in outcomes:
             history.record(query=getattr(self, "_query", ""),
@@ -307,25 +235,7 @@ class Handler(BaseHTTPRequestHandler):
                            duration_ms=int((time.monotonic() -
                                             getattr(self, "_started", time.monotonic())) * 1000))
 
-        summary = " ".join(
-            o["result"] if o["status"] == "ok" else "Error: " + o["error"]
-            for o in outcomes)
-        failed = [o for o in outcomes if o["status"] != "ok"]
-        payload = {
-            "status": "ok" if not failed else ("error" if len(failed) == len(outcomes)
-                                               else "partial"),
-            "steps": outcomes,
-            "result": summary,
-        }
-        if len(outcomes) == 1:
-            # Keep the single-step response shape stable for existing clients.
-            o = outcomes[0]
-            payload["capability"], payload["params"] = o["capability"], o["params"]
-            if o["status"] == "ok":
-                payload["result"] = o["result"]
-            else:
-                payload["error"] = o["error"]
-        return self._send(200, payload)
+        return self._send(200, plan.summarize(outcomes))
 
 
 def main():
